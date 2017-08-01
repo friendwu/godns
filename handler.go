@@ -1,10 +1,11 @@
 package main
 
 import (
-	"net"
-	"time"
-
+	"github.com/jmcvetta/randutil"
 	"github.com/miekg/dns"
+	"net"
+	"sync"
+	"time"
 )
 
 const (
@@ -14,13 +15,29 @@ const (
 )
 
 type Question struct {
-	qname  string
-	qtype  string
-	qclass string
+	qname      string
+	qtype      string
+	qclass     string
+	clientaddr net.IP
+}
+
+type LogMsg struct {
+	clientIP      string
+	clientPort    int
+	clientId      uint16
+	mode          string
+	qname         string
+	qtype         string
+	qclass        string
+	rcode         string
+	ecs           bool
+	ecsClientAddr string
+	hit           string
+	upstream      []UpstreamCtx
 }
 
 func (q *Question) String() string {
-	return q.qname + " " + q.qclass + " " + q.qtype
+	return q.qname + " " + q.qclass + " " + q.qtype + " " + q.clientaddr.String()
 }
 
 type GODNSHandler struct {
@@ -46,7 +63,11 @@ func NewHandler() *GODNSHandler {
 		panic(err)
 	}
 	clientConfig.Timeout = resolvConfig.Timeout
-	resolver = &Resolver{clientConfig}
+	resolver = &Resolver{
+		clientConfig, map[string]*NsStat{},
+		make([]string, 0), sync.RWMutex{},
+		time.Now(), make([]randutil.Choice, 0)}
+	resolver.Init()
 
 	cacheConfig = settings.Cache
 	switch cacheConfig.Backend {
@@ -61,6 +82,7 @@ func NewHandler() *GODNSHandler {
 			Expire:   time.Duration(cacheConfig.Expire) * time.Second / 2,
 			Maxcount: cacheConfig.Maxcount,
 		}
+
 	case "memcache":
 		cache = NewMemcachedCache(
 			settings.Memcache.Servers,
@@ -81,6 +103,16 @@ func NewHandler() *GODNSHandler {
 		panic("Invalid cache backend")
 	}
 
+	L := func(cache Cache, negCache Cache) {
+		for {
+			time.Sleep(10 * time.Second)
+			cache.ClearExpire()
+			negCache.ClearExpire()
+		}
+	}
+
+	go L(cache, negCache)
+
 	var hosts Hosts
 	if settings.Hosts.Enable {
 		hosts = NewHosts(settings.Hosts, settings.Redis)
@@ -89,17 +121,27 @@ func NewHandler() *GODNSHandler {
 	return &GODNSHandler{resolver, cache, negCache, hosts}
 }
 
-func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) {
+func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) (lmsg LogMsg) {
 	q := req.Question[0]
-	Q := Question{UnFqdn(q.Name), dns.TypeToString[q.Qtype], dns.ClassToString[q.Qclass]}
 
 	var remote net.IP
+
 	if Net == "tcp" {
 		remote = w.RemoteAddr().(*net.TCPAddr).IP
+		lmsg.clientIP = w.RemoteAddr().(*net.TCPAddr).IP.String()
+		lmsg.clientPort = w.RemoteAddr().(*net.TCPAddr).Port
 	} else {
 		remote = w.RemoteAddr().(*net.UDPAddr).IP
+		lmsg.clientIP = w.RemoteAddr().(*net.UDPAddr).IP.String()
+		lmsg.clientPort = w.RemoteAddr().(*net.UDPAddr).Port
 	}
-	logger.Info("%s lookup　%s", remote, Q.String())
+	Q := Question{UnFqdn(q.Name), dns.TypeToString[q.Qtype], dns.ClassToString[q.Qclass], remote}
+
+	lmsg.clientId = req.Id
+	lmsg.mode = Net
+	lmsg.qname = Q.String()
+	lmsg.qtype = dns.TypeToString[q.Qtype]
+	lmsg.qclass = dns.ClassToString[q.Qclass]
 
 	IPQuery := h.isIPQuery(q)
 
@@ -134,6 +176,7 @@ func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) {
 				}
 			}
 
+			lmsg.rcode = dns.RcodeToString[m.Rcode]
 			w.WriteMsg(m)
 			logger.Debug("%s found in hosts file", Q.qname)
 			return
@@ -142,32 +185,85 @@ func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}
 
+	extra := make([]dns.RR, 0)
+
+	lmsg.ecs = false
+	lmsg.ecsClientAddr = "0"
+	ecs := false
+	for _, xx := range req.Extra {
+		if rr, ok := xx.(*dns.OPT); ok {
+			for _, yy := range rr.Option {
+				if edns_subnet, ok1 := yy.(*dns.EDNS0_SUBNET); ok1 {
+					Q.clientaddr = edns_subnet.Address
+					extra = append(extra, rr)
+					ecs = true
+					lmsg.ecs = true
+					lmsg.ecsClientAddr = Q.clientaddr.String()
+				}
+			}
+		} else {
+			extra = append(extra, rr)
+		}
+	}
+
 	// Only query cache when qtype == 'A'|'AAAA' , qclass == 'IN'
 	key := KeyGen(Q)
+	//logger.Debug("cache key %s", key)
+
 	if IPQuery > 0 {
 		mesg, err := h.cache.Get(key)
 		if err != nil {
 			if mesg, err = h.negCache.Get(key); err != nil {
 				logger.Debug("%s didn't hit cache", Q.String())
+				lmsg.hit = "MISS"
 			} else {
+				lmsg.hit = "HIT"
 				logger.Debug("%s hit negative cache", Q.String())
+				lmsg.rcode = dns.RcodeToString[dns.RcodeServerFailure]
 				dns.HandleFailed(w, req)
 				return
 			}
 		} else {
+			lmsg.hit = "HIT"
 			logger.Debug("%s hit cache", Q.String())
 			// we need this copy against concurrent modification of Id
 			msg := *mesg
+
+			lmsg.rcode = dns.RcodeToString[msg.Rcode]
 			msg.Id = req.Id
 			w.WriteMsg(&msg)
 			return
 		}
 	}
 
-	mesg, err := h.resolver.Lookup(Net, req)
+	//add client addr to extra, if extra empty.
+	if ecs != true {
+		o := new(dns.OPT)
+		o.Hdr.Name = "."
+		o.Hdr.Rrtype = dns.TypeOPT
+		o.Hdr.Class = 4096
+		e := new(dns.EDNS0_SUBNET)
+		e.Code = dns.EDNS0SUBNET
+
+		if remote.To4() != nil {
+			e.Family = 1
+			e.SourceNetmask = 32
+		} else { //IPV6
+			e.Family = 2
+			e.SourceNetmask = 128
+		}
+		e.SourceScope = 0
+		e.Address = remote
+		o.Option = append(o.Option, e)
+		extra = append(extra, o)
+	}
+	req.Extra = extra
+
+	mesg, upstream, err := h.resolver.Lookup(Net, req)
+	lmsg.upstream = upstream
 
 	if err != nil {
-		logger.Warn("Resolve query error %s", err)
+		lmsg.rcode = dns.RcodeToString[dns.RcodeServerFailure]
 		dns.HandleFailed(w, req)
 
 		// cache the failure, too!
@@ -177,23 +273,61 @@ func (h *GODNSHandler) do(Net string, w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
+	if ecs != true {
+		mesg.Extra = make([]dns.RR, 0)
+	}
+
+	lmsg.rcode = dns.RcodeToString[mesg.Rcode]
 	w.WriteMsg(mesg)
 
-	if IPQuery > 0 && len(mesg.Answer) > 0 {
+	if IPQuery > 0 && (len(mesg.Answer) > 0 || len(mesg.Ns) > 0) {
 		err = h.cache.Set(key, mesg)
 		if err != nil {
 			logger.Warn("Set %s cache failed: %s", Q.String(), err.Error())
 		}
 		logger.Debug("Insert %s into cache", Q.String())
 	}
+	return
+}
+
+func (h *GODNSHandler) queryLog(lmsg LogMsg) {
+	/*
+	 * log format:
+	 * [client_addr]#[client_port]#[dns_id]
+	 * [mode]
+	 * [qname]
+	 * [qclass]
+	 * [qtype]
+	 * [rcode]
+	 * [ecs_mode] [ecs_client_addr]
+	 * [upstream]
+	 * [HIT/MISS]
+	 */
+
+	upstream := ""
+	for _, u := range lmsg.upstream {
+		upstream += u.name
+		upstream += " "
+	}
+
+	/*
+		    logger.Info("query: %s(ip)#%d(port)#%d(id) %s(mode)
+			%s(qname) %s(qclass) %s(qtype) %s(rcode) %t(ecs)/%s(ecsClientAddr) %s(upstream) %s(hit)",
+	*/
+	logger.Info("query: %s#%d#%d %s %s %s %s %s %t/%s %s %s",
+		lmsg.clientIP, lmsg.clientPort, lmsg.clientId, lmsg.mode,
+		lmsg.qname, lmsg.qclass, lmsg.qtype, lmsg.rcode, lmsg.ecs,
+		lmsg.ecsClientAddr, upstream, lmsg.hit)
 }
 
 func (h *GODNSHandler) DoTCP(w dns.ResponseWriter, req *dns.Msg) {
-	h.do("tcp", w, req)
+	lmsg := h.do("tcp", w, req)
+	h.queryLog(lmsg)
 }
 
 func (h *GODNSHandler) DoUDP(w dns.ResponseWriter, req *dns.Msg) {
-	h.do("udp", w, req)
+	lmsg := h.do("udp", w, req)
+	h.queryLog(lmsg)
 }
 
 func (h *GODNSHandler) isIPQuery(q dns.Question) int {
@@ -202,7 +336,7 @@ func (h *GODNSHandler) isIPQuery(q dns.Question) int {
 	}
 
 	switch q.Qtype {
-	case dns.TypeA:
+	case dns.TypeA, dns.TypeCNAME, dns.TypeNS:
 		return _IP4Query
 	case dns.TypeAAAA:
 		return _IP6Query

@@ -53,6 +53,7 @@ type Cache interface {
 	Set(key string, Msg *dns.Msg) error
 	Exists(key string) bool
 	Remove(key string) error
+	ClearExpire()
 	Full() bool
 }
 
@@ -77,7 +78,6 @@ func (c *MemoryCache) Get(key string) (*dns.Msg, error) {
 	}
 
 	return mesg.Msg, nil
-
 }
 
 func (c *MemoryCache) Set(key string, msg *dns.Msg) error {
@@ -119,6 +119,21 @@ func (c *MemoryCache) Full() bool {
 		return false
 	}
 	return c.Length() >= c.Maxcount
+}
+
+func (c *MemoryCache) ClearExpire() {
+	c.mu.Lock()
+	i := 0
+	for key, mesg := range c.Backend {
+		if mesg.Expire.Before(time.Now()) {
+			delete(c.Backend, key)
+		}
+		i++
+		if i >= 1000 {
+			break
+		}
+	}
+	c.mu.Unlock()
 }
 
 /*
@@ -183,6 +198,10 @@ func (m *MemcachedCache) Remove(key string) error {
 func (m *MemcachedCache) Full() bool {
 	// memcache is never full (LRU)
 	return false
+}
+
+func (c *MemcachedCache) ClearExpire() {
+	return
 }
 
 /*
